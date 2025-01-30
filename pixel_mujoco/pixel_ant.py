@@ -15,7 +15,7 @@
 
 """Quadruped Domain."""
 import cv2
-import collections
+import collections, time
 import numpy as np
 
 from dm_control import suite
@@ -31,6 +31,7 @@ from lxml import etree
 from scipy import ndimage
 from gymnasium.spaces import Box
 from gymnasium.core import Env
+from collections import deque
 
 enums = mjbindings.enums
 mjlib = mjbindings.mjlib
@@ -339,6 +340,13 @@ class Reach(base.Task):
     return _upright_reward(physics) * reach_reward
 
 
+class Observation:
+  """ Dummy class """
+  def __init__(self, image, proprioception):
+    self.image = image
+    self.proprioception = proprioception
+
+
 class VisualAntReacher(Env):
   def __init__(self, **kwargs):
     self.env = reach_target()
@@ -357,6 +365,8 @@ class VisualAntReacher(Env):
     # Action space
     self._action_dim = self.env.action_spec().shape[0]
     self._use_image = True
+    self._image_history_len = 3
+    self.stacked_frames = deque(maxlen=self._image_history_len)
 
   def get_observation(self, time_step):
     """_summary_
@@ -382,14 +392,18 @@ class VisualAntReacher(Env):
         pixels = cv2.cvtColor(pixels, cv2.COLOR_RGB2BGR)
         frames.append(pixels)
 
-    image = np.concatenate(frames, axis=1)
+    image = np.concatenate(frames, axis=-1)
+    image = np.transpose(image, (2, 0, 1))
     return image, proprioception
   
   def reset(self, *, seed = None, options = None):
     time_step = self.env.reset()
     info = {}
     image, proprioception = self.get_observation(time_step)
-    return image, proprioception, info
+    for _ in range(self._image_history_len):
+      self.stacked_frames.append(image)
+    obs = Observation(np.concatenate(self.stacked_frames), proprioception)
+    return obs, info
   
   def step(self, action):
     time_step = self.env.step(action)
@@ -398,8 +412,9 @@ class VisualAntReacher(Env):
     truncated = False
     info = {}
     image, proprioception = self.get_observation(time_step)
-
-    return image, proprioception, reward, terminated, truncated, info
+    self.stacked_frames.append(image)
+    obs = Observation(np.concatenate(self.stacked_frames), proprioception)
+    return obs, reward, terminated, truncated, info
 
   @property
   def observation_space(self):
@@ -407,17 +422,11 @@ class VisualAntReacher(Env):
 
   @property
   def image_space(self):
-      if not self._use_image:
-          raise AttributeError(f'use_image={self._use_image}')
-
-      image_shape = (3 * self._image_buffer.maxlen, 84, 84)
+      image_shape = (6 * self.stacked_frames.maxlen, 84, 84)
       return Box(low=0, high=255, shape=image_shape)
 
   @property
   def proprioception_space(self):
-      if not self._use_image:
-          raise AttributeError(f'use_image={self._use_image}')
-      
       return self.observation_space
 
   @property
@@ -460,28 +469,29 @@ def simple_env():
         # Concatenate frames horizontally
         combined_frame = cv2.hconcat(frames)
         cv2.imshow('Environment', combined_frame)
+        time.sleep(1)
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
 
 
 if __name__ == "__main__":
+  # simple_env()
   env = VisualAntReacher()
 
   for EP in range(10):
-    image, proprioception, _ = env.reset()
+    obs, _ = env.reset()
     terminated, truncated = False, False
     ret, steps = 0, 0
     while not (terminated or truncated):
       # Concatenate frames horizontally
-      cv2.imshow('Environment', image)
+      cv2.imshow('Environment', np.transpose(obs.image, (1, 2, 0))[:, :, -3:])
       if cv2.waitKey(1) & 0xFF == ord('q'):
           break
         
       action = env.action_space.sample()
-      next_image, next_proprioception, reward, terminated, truncated, info = env.step(action)
-      image = next_image
-      proprioception = next_proprioception
+      obs, reward, terminated, truncated, info = env.step(action)
+      next_obs = obs
       ret += reward
       steps += 1
 
-    print(f"Episdoe {EP} ended with return {ret:.2f} in {steps} timesteps.")
+    print(f"Episode {EP} ended with return {ret:.2f} in {steps} timesteps.")
