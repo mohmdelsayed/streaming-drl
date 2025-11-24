@@ -19,7 +19,7 @@ def initialize_weights(m):
         m.bias.data.fill_(0.0)
 
 class StreamQ(nn.Module):
-    def __init__(self, n_obs=11, n_actions=3, hidden_size=32, lr=1.0, epsilon_target=0.01, epsilon_start=1.0, exploration_fraction=0.1, total_steps=1_000_000, gamma=0.99, lamda=0.8, kappa_value=2.0):
+    def __init__(self, n_obs=11, n_actions=3, hidden_size=32, lr=1.0, epsilon_target=0.01, epsilon_start=1.0, exploration_fraction=0.1, total_steps=1_000_000, gamma=0.99, lamda=0.8, kappa_value=2.0, seed=0):
         super(StreamQ, self).__init__()
         self.n_actions = n_actions
         self.gamma = gamma
@@ -29,6 +29,7 @@ class StreamQ(nn.Module):
         self.exploration_fraction = exploration_fraction
         self.total_steps = total_steps
         self.time_step = 0
+        self.seed = seed
         self.fc1_v   = nn.Linear(n_obs, hidden_size)
         self.hidden_v  = nn.Linear(hidden_size, hidden_size)
         self.fc_v  = nn.Linear(hidden_size, n_actions)
@@ -91,7 +92,7 @@ def main(env_name, seed, lr, gamma, lamda, total_steps, epsilon_target, epsilon_
     env = ScaleReward(env, gamma=gamma)
     env = NormalizeObservation(env)
     env = AddTimeInfo(env)
-    agent = StreamQ(n_obs=env.observation_space.shape[0], n_actions=env.action_space.n, lr=lr, gamma=gamma, lamda=lamda, epsilon_target=epsilon_target, epsilon_start=epsilon_start, exploration_fraction=exploration_fraction, total_steps=total_steps, kappa_value=kappa_value)
+    agent = StreamQ(n_obs=env.observation_space.shape[0], n_actions=env.action_space.n, lr=lr, gamma=gamma, lamda=lamda, epsilon_target=epsilon_target, epsilon_start=epsilon_start, exploration_fraction=exploration_fraction, total_steps=total_steps, kappa_value=kappa_value, seed=seed)
     if debug:
         print("seed: {}".format(seed), "env: {}".format(env.spec.id))
     returns, term_time_steps = [], []
