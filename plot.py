@@ -44,13 +44,13 @@ def main(data_dir, int_space, total_steps):
 
     plt.xlabel("Time Step", fontsize=14)
     plt.ylabel(f"Average Episodic Return", fontsize=14)
-    plt.title(r"Stream AC(0.8)" + f" in {env_name}")
+    plt.title(r"Stream-AC" + f" in {env_name}")
     plt.savefig(f"{env_name}.pdf")
 
 if __name__ == '__main__':
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument('--data_dir', type=str, default='data_stream_ac_Ant-v4_lr1.0_gamma0.99_lamda0.8_entropy_coeff0.01')
+    parser.add_argument('--data_dir', type=str, default='data')
     parser.add_argument('--int_space', type=int, default=50_000)
     parser.add_argument('--total_steps', type=int, default=2_000_000)
     args = parser.parse_args()

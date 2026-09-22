@@ -1,39 +1,30 @@
-import os, pickle, argparse
-import torch
-import numpy as np
-import torch.nn as nn
+import argparse
+import os
+import pickle
 
 import gymnasium as gym
-from optim import ObGD as Optimizer
+import numpy as np
+import torch
+import torch.nn as nn
 from stable_baselines3.common.atari_wrappers import (
     EpisodicLifeEnv,
     FireResetEnv,
     MaxAndSkipEnv,
     NoopResetEnv,
 )
-import torch.nn.functional as F
-from normalization_wrappers import NormalizeObservation, ScaleReward
+
+from obs_reward_transforms import NormalizeObservation, ScaleReward
+from optimizer import StreamingOptimizer
 from sparse_init import sparse_init
+
+torch.set_default_dtype(torch.float64)
 
 def linear_schedule(start_e: float, end_e: float, duration: int, t: int):
     slope = (end_e - start_e) / duration
     return max(slope * t + start_e, end_e)
 
-class LayerNormalization(nn.Module):
-    def __init__(self):
-        super().__init__()
-    def forward(self, input):
-        return F.layer_norm(input, input.size())
-    def extra_repr(self) -> str:
-        return "Layer Normalization"
-
-def initialize_weights(m):
-    if isinstance(m, nn.Linear) or isinstance(m, nn.Conv2d):
-        sparse_init(m.weight, sparsity=0.9)
-        m.bias.data.fill_(0.0)
-
 class StreamQ(nn.Module):
-    def __init__(self, n_actions=3, hidden_size=256, lr=1.0, epsilon_target=0.01, epsilon_start=1.0, exploration_fraction=0.1, total_steps=1_000_000, gamma=0.99, lamda=0.8, kappa_value=2.0):
+    def __init__(self, n_actions=3, hidden_size=256, lr=3e-4, epsilon_target=0.01, epsilon_start=1.0, exploration_fraction=0.05, total_steps=50_000_000, gamma=0.99, lamda=0.8, beta=0.99995, sparsity=0.95):
         super(StreamQ, self).__init__()
         self.n_actions = n_actions
         self.gamma = gamma
@@ -45,68 +36,57 @@ class StreamQ(nn.Module):
         self.time_step = 0
         self.network = nn.Sequential(
             nn.Conv2d(4, 32, 8, stride=5),
-            LayerNormalization(),
+            nn.LayerNorm([32, 16, 16], elementwise_affine=False),
             nn.LeakyReLU(),
             nn.Conv2d(32, 64, 4, stride=3),
-            LayerNormalization(),
+            nn.LayerNorm([64, 5, 5], elementwise_affine=False),
             nn.LeakyReLU(),
             nn.Conv2d(64, 64, 3, stride=2),
-            LayerNormalization(),
+            nn.LayerNorm([64, 2, 2], elementwise_affine=False),
             nn.LeakyReLU(),
             nn.Flatten(start_dim=0),
             nn.Linear(256, hidden_size),
-            LayerNormalization(),
+            nn.LayerNorm(hidden_size, elementwise_affine=False),
             nn.LeakyReLU(),
             nn.Linear(hidden_size, n_actions)
         )
-        self.apply(initialize_weights)
-        self.optimizer = Optimizer(list(self.parameters()), lr=lr, gamma=gamma, lamda=lamda, kappa=kappa_value)
+        sparse_init(self.modules(), target_sparsity=sparsity)
+        self.optimizer = StreamingOptimizer(self.parameters(), lr=lr, gamma=gamma, lamda=lamda, beta=beta)
 
     def q(self, x):
-        x = torch.tensor(np.array(x), dtype=torch.float)
+        x = torch.as_tensor(np.array(x), dtype=torch.float64)
         return self.network(x)
 
+    @torch.no_grad()
     def sample_action(self, s):
         self.time_step += 1
         self.epsilon = linear_schedule(self.epsilon_start, self.epsilon_target, self.exploration_fraction * self.total_steps, self.time_step)
-        if isinstance(s, np.ndarray):
-            s = torch.tensor(np.array(s), dtype=torch.float)
         if np.random.rand() < self.epsilon:
             q_values = self.q(s)
             greedy_action = torch.argmax(q_values, dim=-1).item()
             random_action = np.random.randint(0, self.n_actions)
             if greedy_action == random_action:
                 return random_action, False
-            else:
-                return random_action, True
-        else:
-            q_values = self.q(s)
-            return torch.argmax(q_values, dim=-1), False
+            return random_action, True
+        q_values = self.q(s)
+        return torch.argmax(q_values, dim=-1).item(), False
 
-    def update_params(self, s, a, r, s_prime, done, is_nongreedy, overshooting_info=False):
-        done_mask = 0 if done else 1
-        s, a, r, s_prime, done_mask = torch.tensor(np.array(s), dtype=torch.float), torch.tensor([a], dtype=torch.int).squeeze(0), \
-                                         torch.tensor(np.array(r)), torch.tensor(np.array(s_prime), dtype=torch.float), \
-                                         torch.tensor(np.array(done_mask), dtype=torch.float)
-        
+    def update_params(self, s, a, r, s_prime, terminated, truncated, is_nongreedy):
+        reset = terminated or truncated or is_nongreedy
+        done_mask = 0.0 if terminated else 1.0
+        a = torch.as_tensor(a, dtype=torch.int64)
+        r = torch.as_tensor(r, dtype=torch.float64)
+        done_mask = torch.as_tensor(done_mask, dtype=torch.float64)
         q_sa = self.q(s)[a]
-        max_q_s_prime_a_prime = torch.max(self.q(s_prime), dim=-1).values
-        td_target = r + self.gamma * max_q_s_prime_a_prime * done_mask
-        delta = td_target - q_sa
-
-        q_output = -q_sa
-        self.optimizer.zero_grad()
-        q_output.backward()
-        self.optimizer.step(delta.item(), reset=(done or is_nongreedy))
-
-        if overshooting_info:
+        with torch.no_grad():
             max_q_s_prime_a_prime = torch.max(self.q(s_prime), dim=-1).values
             td_target = r + self.gamma * max_q_s_prime_a_prime * done_mask
-            delta_bar = td_target - self.q(s)[a]
-            if torch.sign(delta_bar * delta).item() == -1:
-                print("Overshooting Detected!")
+            delta_value = float((td_target - q_sa).item())
+        self.optimizer.zero_grad()
+        q_sa.backward()
+        self.optimizer.step(delta_value, reset=reset)
 
-def main(env_name, seed, lr, gamma, lamda, total_steps, epsilon_target, epsilon_start, exploration_fraction, kappa_value, debug, overshooting_info, render=False):
+def main(env_name, seed, lr, gamma, lamda, beta, total_steps, epsilon_target, epsilon_start, exploration_fraction, hidden_size, debug, render=False, sparsity=0.95):
     torch.manual_seed(seed); np.random.seed(seed)
     env = gym.make(env_name, render_mode='human') if render else gym.make(env_name)
     env = gym.wrappers.RecordEpisodeStatistics(env)
@@ -117,29 +97,40 @@ def main(env_name, seed, lr, gamma, lamda, total_steps, epsilon_target, epsilon_
         env = FireResetEnv(env)
     env = gym.wrappers.ResizeObservation(env, (84, 84))
     env = gym.wrappers.GrayScaleObservation(env)
-    env = NormalizeObservation(env)
     env = gym.wrappers.FrameStack(env, 4)
-    env = ScaleReward(env, gamma=gamma)
-    agent = StreamQ(n_actions=env.action_space.n, lr=lr, gamma=gamma, lamda=lamda, epsilon_target=epsilon_target, epsilon_start=epsilon_start, exploration_fraction=exploration_fraction, total_steps=total_steps, kappa_value=kappa_value)
+    reward_scaler = ScaleReward(gamma=gamma)
+    observation_normalizer = NormalizeObservation(env.observation_space, shared_axis=0)
+    agent = StreamQ(n_actions=env.action_space.n, hidden_size=hidden_size, lr=lr, gamma=gamma, lamda=lamda, beta=beta, epsilon_target=epsilon_target, epsilon_start=epsilon_start, exploration_fraction=exploration_fraction, total_steps=total_steps, sparsity=sparsity)
     if debug:
         print("seed: {}".format(seed), "env: {}".format(env.spec.id))
     returns, term_time_steps = [], []
-    s, _ = env.reset(seed=seed)
     episode_num = 1
+    s, _ = env.reset(seed=seed)
+    s = observation_normalizer.normalize(s)
+    a, _ = agent.sample_action(s)
     for t in range(1, total_steps+1):
-        a, is_nongreedy = agent.sample_action(s)
-        s_prime, r, terminated, _, info = env.step(a)
-        agent.update_params(s, a, r, s_prime, terminated, is_nongreedy, overshooting_info)
-        s = s_prime
+        s_prime, r, terminated, truncated, info = env.step(a)
+        s_prime = observation_normalizer.normalize(s_prime)
+        r = reward_scaler.scale(r, terminated=terminated, truncated=truncated)
+        if terminated or truncated:
+            a_prime, next_is_nongreedy = None, False
+        else:
+            a_prime, next_is_nongreedy = agent.sample_action(s_prime)
+        agent.update_params(s, a, r, s_prime, terminated, truncated, next_is_nongreedy)
         if info and "episode" in info:
             if debug:
                 print("Episodic Return: {}, Time Step {}, Episode Number {}, Epsilon {}".format(info['episode']['r'][0], t, episode_num, agent.epsilon))
             returns.append(info['episode']['r'][0])
             term_time_steps.append(t)
-            s, _ = env.reset()
             episode_num += 1
+        if terminated or truncated:
+            s, _ = env.reset()
+            s = observation_normalizer.normalize(s)
+            a, _ = agent.sample_action(s)
+        else:
+            s = s_prime; a = a_prime
     env.close()
-    save_dir = "data_stream_q_{}_lr{}_gamma{}_lamda{}".format(env.spec.id, lr, gamma, lamda)
+    save_dir = "data_stream_q_{}_lr{}_gamma{}_lamda{}_beta{}_hidden_size{}_sparsity{}".format(env.spec.id, lr, gamma, lamda, beta, hidden_size, sparsity)
     if not os.path.exists(save_dir):
         os.makedirs(save_dir)
     with open(os.path.join(save_dir, "seed_{}.pkl".format(seed)), "wb") as f:
@@ -149,16 +140,17 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Stream Q(λ)')
     parser.add_argument('--env_name', type=str, default='BreakoutNoFrameskip-v4')
     parser.add_argument('--seed', type=int, default=0)
-    parser.add_argument('--lr', type=float, default=1.0)
+    parser.add_argument('--lr', type=float, default=3e-4)
     parser.add_argument('--gamma', type=float, default=0.99)
     parser.add_argument('--lamda', type=float, default=0.8)
+    parser.add_argument('--beta', type=float, default=0.99995, help='Retained fraction in [0, 1)')
     parser.add_argument('--epsilon_target', type=float, default=0.01)
     parser.add_argument('--epsilon_start', type=float, default=1.0)
     parser.add_argument('--exploration_fraction', type=float, default=0.05)
-    parser.add_argument('--kappa_value', type=float, default=2.0)
-    parser.add_argument('--total_steps', type=int, default=10_000_000)
+    parser.add_argument('--total_steps', type=int, default=50_000_000)
+    parser.add_argument('--hidden_size', type=int, default=256)
     parser.add_argument('--debug', action='store_true')
-    parser.add_argument('--overshooting_info', action='store_true')
     parser.add_argument('--render', action='store_true')
+    parser.add_argument('--sparsity', type=float, default=0.95, help='Global target sparsity for ERK initialization (fraction of weights set to zero)')
     args = parser.parse_args()
-    main(args.env_name, args.seed, args.lr, args.gamma, args.lamda, args.total_steps, args.epsilon_target, args.epsilon_start, args.exploration_fraction, args.kappa_value, args.debug, args.overshooting_info, args.render)
+    main(args.env_name, args.seed, args.lr, args.gamma, args.lamda, args.beta, args.total_steps, args.epsilon_target, args.epsilon_start, args.exploration_fraction, args.hidden_size, args.debug, args.render, args.sparsity)
